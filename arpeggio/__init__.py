@@ -3,7 +3,7 @@
 # Name: arpeggio.py
 # Purpose: PEG parser interpreter
 # Author: Igor R. Dejanović <igor DOT dejanovic AT gmail DOT com>
-# Copyright: (c) 2009-2015 Igor R. Dejanović <igor DOT dejanovic AT gmail DOT com>
+# Copyright: (c) 2009-2017 Igor R. Dejanović <igor DOT dejanovic AT gmail DOT com>
 # License: MIT License
 #
 # This is an implementation of packrat parser interpreter based on PEG
@@ -19,7 +19,7 @@ import bisect
 from arpeggio.utils import isstr
 import types
 
-__version__ = "1.6.dev0"
+__version__ = "1.9.0"
 
 if sys.version < '3':
     text = unicode
@@ -61,7 +61,7 @@ class NoMatch(Exception):
     match is not successful.
 
     Args:
-        rules (list of ParserExpression): Rules that are tried at the position
+        rules (list of ParsingExpression): Rules that are tried at the position
             of the exception.
         position (int): A position in the input stream where exception
             occurred.
@@ -127,19 +127,22 @@ class DebugPrinter(object):
     def __init__(self, **kwargs):
 
         self.debug = kwargs.pop("debug", False)
+        self.file = kwargs.pop("file", sys.stdout)
         self._current_ident = 0
 
         super(DebugPrinter, self).__init__(**kwargs)
 
     def dprint(self, message, ident_change=0):
         """
-        Handle debug message. Current implementation will print to stdout using
-        the current identation level.
+        Handle debug message. Print to the stream specified by the 'file'
+        keyword argument at the current indentation level. Default stream is
+        stdout.
         """
         if ident_change < 0:
             self._current_ident += ident_change
 
-        print(("%s%s" % ("   " * self._current_ident, message)))
+        print(("%s%s" % ("   " * self._current_ident, message)),
+              file=self.file)
 
         if ident_change > 0:
             self._current_ident += ident_change
@@ -411,10 +414,8 @@ class Repetition(ParsingExpression):
     """
     def __init__(self, *elements, **kwargs):
         super(Repetition, self).__init__(*elements, **kwargs)
-        if 'eolterm' in kwargs:
-            self.eolterm = kwargs['eolterm']
-        else:
-            self.eolterm = False
+        self.eolterm = kwargs.get('eolterm', False)
+        self.sep = kwargs.get('sep', None)
 
 
 class Optional(Repetition):
@@ -426,17 +427,10 @@ class Optional(Repetition):
         result = None
         c_pos = parser.position
 
-        # Set parser for optional mode
-        oldin_optional = parser.in_optional
-        parser.in_optional = True
-
         try:
             result = [self.nodes[0].parse(parser)]
         except NoMatch:
             parser.position = c_pos  # Backtracking
-
-        # Restore in_optional state
-        parser.in_optional = oldin_optional
 
         return result
 
@@ -455,17 +449,20 @@ class ZeroOrMore(Repetition):
             old_eolterm = parser.eolterm
             parser.eolterm = self.eolterm
 
-        # Set parser for optional mode
-        oldin_optional = parser.in_optional
-        parser.in_optional = True
-
         # Prefetching
         append = results.append
         p = self.nodes[0].parse
+        sep = self.sep.parse if self.sep else None
+        result = None
 
         while True:
             try:
                 c_pos = parser.position
+                if sep and result:
+                    sep_result = sep(parser)
+                    if not sep_result:
+                        break
+                    append(sep_result)
                 result = p(parser)
                 if not result:
                     break
@@ -477,9 +474,6 @@ class ZeroOrMore(Repetition):
         if self.eolterm:
             # Restore previous eolterm
             parser.eolterm = old_eolterm
-
-        # Restore in_optional state
-        parser.in_optional = oldin_optional
 
         return results
 
@@ -498,23 +492,26 @@ class OneOrMore(Repetition):
             old_eolterm = parser.eolterm
             parser.eolterm = self.eolterm
 
-        # Set parser for optional mode
-        oldin_optional = parser.in_optional
-
         # Prefetching
         append = results.append
         p = self.nodes[0].parse
+        sep = self.sep.parse if self.sep else None
+        result = None
 
         try:
             while True:
                 try:
                     c_pos = parser.position
+                    if sep and result:
+                        sep_result = sep(parser)
+                        if not sep_result:
+                            break
+                        append(sep_result)
                     result = p(parser)
                     if not result:
                         break
                     append(result)
                     first = False
-                    parser.in_optional = True
                 except NoMatch:
                     parser.position = c_pos  # Backtracking
 
@@ -527,10 +524,84 @@ class OneOrMore(Repetition):
                 # Restore previous eolterm
                 parser.eolterm = old_eolterm
 
-            # Restore in_optional state
-            parser.in_optional = oldin_optional
-
         return results
+
+
+class UnorderedGroup(Repetition):
+    """
+    Will try to match all of the parsing expression in any order.
+    """
+    def _parse(self, parser):
+        results = []
+        c_pos = parser.position
+
+        if self.eolterm:
+            # Remember current eolterm and set eolterm of
+            # this repetition
+            old_eolterm = parser.eolterm
+            parser.eolterm = self.eolterm
+
+        # Prefetching
+        append = results.append
+        nodes_to_try = set(self.nodes)
+        sep = self.sep.parse if self.sep else None
+        result = None
+        sep_result = None
+        first = True
+
+        while nodes_to_try:
+            sep_exc = None
+
+            # Separator
+            c_loc_pos_sep = parser.position
+            if sep and not first:
+                try:
+                    sep_result = sep(parser)
+                except NoMatch as e:
+                    parser.position = c_loc_pos_sep     # Backtracking
+
+                    # This still might be valid if all remaining subexpressions
+                    # are optional and none of them will match
+                    sep_exc = e
+
+            c_loc_pos = parser.position
+            match = True
+            all_optionals_fail = True
+            for e in set(nodes_to_try):
+                try:
+                    result = e.parse(parser)
+                    if result:
+                        if sep_exc:
+                            raise sep_exc
+                        if sep_result:
+                            append(sep_result)
+                        first = False
+                        match = True
+                        all_optionals_fail = False
+                        append(result)
+                        nodes_to_try.remove(e)
+                        break
+
+                except NoMatch:
+                    match = False
+                    parser.position = c_loc_pos     # local backtracking
+
+            if not match or all_optionals_fail:
+                # If sep is matched backtrack it
+                parser.position = c_loc_pos_sep
+                break
+
+        if self.eolterm:
+            # Restore previous eolterm
+            parser.eolterm = old_eolterm
+
+        if not match:
+            # Unsucessful match of the whole PE - full backtracking
+            parser.position = c_pos
+            parser._nm_raise(self, c_pos, parser)
+
+        if results:
+            return results
 
 
 class SyntaxPredicate(ParsingExpression):
@@ -652,7 +723,14 @@ class Match(ParsingExpression):
                         parser.comments.append(
                             parser.comments_model.parse(parser))
                         if parser.skipws:
-                            parser._skip_ws()
+                            # Whitespace skipping
+                            pos = parser.position
+                            ws = parser.ws
+                            i = parser.input
+                            length = len(i)
+                            while pos < length and i[pos] in ws:
+                                pos += 1
+                            parser.position = pos
                 except NoMatch:
                     # NoMatch in comment matching is perfectly
                     # legal and no action should be taken.
@@ -663,7 +741,14 @@ class Match(ParsingExpression):
     def parse(self, parser):
 
         if parser.skipws and not parser.in_lex_rule:
-            parser._skip_ws()
+            # Whitespace skipping
+            pos = parser.position
+            ws = parser.ws
+            i = parser.input
+            length = len(i)
+            while pos < length and i[pos] in ws:
+                pos += 1
+            parser.position = pos
 
         if parser.debug:
             parser.dprint(
@@ -674,7 +759,7 @@ class Match(ParsingExpression):
                         parser.position,
                         parser.context()))
 
-        if parser.position in parser.comment_positions:
+        if parser.skipws and parser.position in parser.comment_positions:
             # Skip comments if already parsed.
             parser.position = parser.comment_positions[parser.position]
         else:
@@ -697,21 +782,34 @@ class RegExMatch(Match):
             It will be used to create regular expression using re.compile.
         ignore_case(bool): If case insensitive match is needed.
             Default is None to support propagation from global parser setting.
+        multiline(bool): allow regex to works on multiple lines
+            (re.DOTALL flag). Default is None to support propagation from
+            global parser setting.
         str_repr(str): A string that is used to represent this regex.
+        re_flags: flags parameter for re.compile if neither ignore_case
+            or multiple are set.
 
     '''
     def __init__(self, to_match, rule_name='', root=False, ignore_case=None,
-                 str_repr=None):
+                 multiline=None, str_repr=None, re_flags=re.MULTILINE):
         super(RegExMatch, self).__init__(rule_name, root)
         self.to_match_regex = to_match
         self.ignore_case = ignore_case
+        self.multiline = multiline
+        self.explicit_flags = re_flags
 
         self.to_match = str_repr if str_repr is not None else to_match
 
     def compile(self):
-        flags = re.MULTILINE
-        if self.ignore_case:
+        flags = self.explicit_flags
+        if self.multiline is True:
+            flags |= re.DOTALL
+        if self.multiline is False and flags & re.DOTALL:
+            flags -= re.DOTALL
+        if self.ignore_case is True:
             flags |= re.IGNORECASE
+        if self.ignore_case is False and flags & re.IGNORECASE:
+            flags -= re.IGNORECASE
         self.regex = re.compile(self.to_match_regex, flags)
 
     def __str__(self):
@@ -731,7 +829,7 @@ class RegExMatch(Match):
                     (matched, c_pos, parser.context(len(matched))))
             parser.position += len(matched)
             if matched:
-                return Terminal(self, c_pos, matched)
+                return Terminal(self, c_pos, matched, extra_info=m)
         else:
             if parser.debug:
                 parser.dprint("-- NoMatch at {}".format(c_pos))
@@ -846,6 +944,10 @@ class ParseTreeNode(object):
             root rule or empty string otherwise.
         position (int): A position in the input stream where the match
             occurred.
+        position_end (int, read-only): A position in the input stream where
+            the node ends.
+            This position is one char behind the last char contained in this
+            node. Thus, position_end - position = length of the node.
         error (bool): Is this a false parse tree node created during error
             recovery.
         comments : A parse tree of comment(s) attached to this node.
@@ -862,6 +964,11 @@ class ParseTreeNode(object):
     @property
     def name(self):
         return "%s [%s]" % (self.rule_name, self.position)
+
+    @property
+    def position_end(self):
+        "Must be implemented in subclasses."
+        raise NotImplementedError
 
     def visit(self, visitor):
         """
@@ -910,15 +1017,19 @@ class Terminal(ParseTreeNode):
             name in the case of an error node.
         suppress(bool): If True this terminal can be ignored in semantic
             analysis.
+        extra_info(object): additional information (e.g. the re matcher
+            object)
     """
 
     __slots__ = ['rule', 'rule_name', 'position', 'error', 'comments',
-                 'value', 'suppress']
+                 'value', 'suppress', 'extra_info']
 
-    def __init__(self, rule, position, value, error=False, suppress=False):
+    def __init__(self, rule, position, value, error=False, suppress=False,
+                 extra_info=None):
         super(Terminal, self).__init__(rule, position, error)
         self.value = value
         self.suppress = suppress
+        self.extra_info = extra_info
 
     @property
     def desc(self):
@@ -926,6 +1037,10 @@ class Terminal(ParseTreeNode):
             return "%s '%s' [%s]" % (self.rule_name, self.value, self.position)
         else:
             return "%s [%s]" % (self.rule_name, self.position)
+
+    @property
+    def position_end(self):
+        return self.position + len(self.value)
 
     def flat_str(self):
         return self.value
@@ -978,6 +1093,10 @@ class NonTerminal(ParseTreeNode, list):
     @property
     def desc(self):
         return self.name
+
+    @property
+    def position_end(self):
+        return self[-1].position_end if self else self.position
 
     def flat_str(self):
         """
@@ -1239,8 +1358,6 @@ class Parser(DebugPrinter):
             Terminal instances.
         in_rule (str): Current rule name.
         in_parse_comments (bool): True if parsing comments.
-        in_optional (bool): True if parsing optionals (Optional, ZeroOrMore or
-            OneOrMore after first).
         in_lex_rule (bool): True if in lexical rule. Currently used in Combine
             decorator to convert match to a single Terminal.
         in_not (bool): True if in Not parsing expression. Used for better error
@@ -1303,10 +1420,6 @@ class Parser(DebugPrinter):
         self.in_rule = ''
 
         self.in_parse_comments = False
-
-        # If under optional PE (Optional or ZeroOrMore or OneOrMore after
-        # first occurence) we do not store NoMatch for error reporting.
-        self.in_optional = False
 
         # Are we in lexical rule? If so do not
         # skip whitespaces.
@@ -1544,17 +1657,6 @@ class Parser(DebugPrinter):
 
         return retval.replace('\n', ' ').replace('\r', '')
 
-    def _skip_ws(self):
-        """
-        Skiping whitespace characters.
-        """
-        pos = self.position
-        ws = self.ws
-        while pos < len(self.input) and \
-                self.input[pos] in ws:
-            pos += 1
-        self.position = pos
-
     def _nm_raise(self, *args):
         """
         Register new NoMatch object if the input is consumed
@@ -1711,6 +1813,13 @@ class ParserPython(Parser):
             elif isinstance(expression, Match):
                 retval = expression
 
+            elif isinstance(expression, UnorderedGroup):
+                retval = expression
+                for n in retval.elements:
+                    retval.nodes.append(inner_from_python(n))
+                if any((isinstance(x, CrossRef) for x in retval.nodes)):
+                    __for_resolving.append(retval)
+
             elif isinstance(expression, Sequence) or \
                     isinstance(expression, Repetition) or \
                     isinstance(expression, SyntaxPredicate) or \
@@ -1733,6 +1842,10 @@ class ParserPython(Parser):
             else:
                 raise GrammarError("Unrecognized grammar element '%s'." %
                                    text(expression))
+
+            # Translate separator expression.
+            if isinstance(expression, Repetition) and expression.sep:
+                expression.sep = inner_from_python(expression.sep)
 
             return retval
 
